@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/oauth2"
 
@@ -23,16 +28,25 @@ var (
 	caddyRepo = filepath.Join(os.Getenv("GOPATH"), "src", buildworker.CaddyPackage)
 
 	githubAccessToken = os.Getenv("GITHUB_TOKEN")
-	buildServerID     = os.Getenv("BUILD_SERVER_ID")
-	buildServerKey    = os.Getenv("BUILD_SERVER_KEY")
+
+	devportalAccountID = os.Getenv("DEVPORTAL_ID")  // account ID at caddyserver.com
+	devportalAPIKey    = os.Getenv("DEVPORTAL_KEY") // associated API key
+
+	// resume allows us to skip some deploy steps using the most recent, existing tag.
+	// only use resume if a tag was pushed but a subsequent step failed.
+	resume string
 )
 
 const (
 	githubOwner = "mholt" // the owner of the repository to publish to
 	githubRepo  = "caddy" // the owner's repository to publish to
+	websiteURL  = "http://localhost:2015" // URL to the Caddy website
 )
 
 func main() {
+	flag.StringVar(&resume, "resume", "", `may be "github" to skip all deploy steps and resume most recent deploy if failed`)
+	flag.Parse()
+
 	fmt.Printf("Using Caddy source at: %s\n", caddyRepo)
 
 	// some initial checks before we begin
@@ -42,34 +56,68 @@ func main() {
 	if err := workingCopyClean(); err != nil {
 		log.Fatalf("Aborting deployment: %v", err)
 	}
-	if err := confirmRightCommit(); err != nil {
-		log.Fatalf("Aborting deployment: %v", err)
-	}
-	if err := confirmReadmeUpdated(); err != nil {
-		log.Fatalf("Aborting deployment: %v", err)
-	}
 
-	// get the tag for the new release
-	tag, prerelease, err := askNewTagVersion()
-	if err != nil {
-		log.Fatal(err)
-	}
+	var tag string
+	var prerelease bool
+	var err error
 
-	// one more check
-	fmt.Println("\nNOTICE: If you continue, your GOPATH will be updated")
-	fmt.Printf("by running `go get -u %s` \n", buildworker.CaddyPackage)
-	fmt.Println("before checks are performed. Tests will follow, and")
-	fmt.Println("the release will continue only if the tests pass.")
-	confirmed, err := askYesNo("I'm ready. Are you ready? There's no going back:")
-	if err != nil {
-		log.Fatal(err)
-	}
-	if !confirmed {
-		log.Fatal("Aborting deployment: operator not ready 🙄")
+	// see if we're resuming a deploy; only do this if a
+	// tag was pushed but some step after the push failed.
+	if resume != "" {
+		// resume a deploy
+
+		tag, err = getCurrentTag()
+		if err != nil {
+			log.Fatal(err)
+		}
+		prerelease = isPrerelease(tag)
+
+		if resume == "github" {
+			fmt.Printf("\nNOTE: The deploy for %s is being resumed.\n", tag)
+			fmt.Println("The process will pick up at publishing a release on GitHub.")
+		} else {
+			log.Fatal("Unknown resume state")
+		}
+
+		confirmed, err := askYesNo("Continue?")
+		if err != nil {
+			log.Fatal(err)
+		}
+		if !confirmed {
+			log.Fatal("Aborting resumed deployment")
+		}
+	} else {
+		// begin a new deploy
+
+		if err := confirmRightCommit(); err != nil {
+			log.Fatalf("Aborting deployment: %v", err)
+		}
+		if err := confirmReadmeUpdated(); err != nil {
+			log.Fatalf("Aborting deployment: %v", err)
+		}
+
+		// get the tag for the new release
+		tag, prerelease, err = askNewTagVersion()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// one more check
+		fmt.Println("\nNOTICE: If you continue, your GOPATH will be updated")
+		fmt.Printf("by running `go get -u %s` \n", buildworker.CaddyPackage)
+		fmt.Println("before checks are performed. Tests will follow, and")
+		fmt.Println("the release will continue only if the tests pass.")
+		confirmed, err := askYesNo("I'm ready. Are you ready? There's no going back:")
+		if err != nil {
+			log.Fatal(err)
+		}
+		if !confirmed {
+			log.Fatal("Aborting deployment: operator not ready 🙄")
+		}
 	}
 
 	// here we goooo!
-	err = deploy(tag, prerelease)
+	err = deploy(tag, prerelease, resume)
 	if err != nil {
 		fmt.Print("\a") // terminal bell, since we might be minutes into a deploy
 		log.Fatal(err)
@@ -81,39 +129,52 @@ func main() {
 
 // deploy runs checks on caddy, and if they succeed, tags
 // the current commit and releases Caddy. Pass in the name
-// of the tag and whether it is a pre-release.
-func deploy(tag string, prerelease bool) error {
-	// run checks to make sure it, you know, works.
-	err := checkCaddy()
-	if err != nil {
-		return fmt.Errorf("checks: %v", err)
-	}
+// of the tag, whether it is a pre-release, and where to
+// resume the deploy at, if at all (otherwise empty string).
+func deploy(tag string, prerelease bool, resume string) error {
+	if resume == "" {
+		// run checks to make sure it, you know, works.
+		err := checkCaddy()
+		if err != nil {
+			return fmt.Errorf("checks: %v", err)
+		}
 
-	// git tag (signed)
-	err = run("git", "tag", "-s", tag, "-m", "")
-	if err != nil {
-		return fmt.Errorf("creating signed tag: %v", err)
-	}
+		// git tag (signed)
+		err = run("git", "tag", "-s", tag, "-m", "")
+		if err != nil {
+			return fmt.Errorf("creating signed tag: %v", err)
+		}
 
-	// git push
-	err = run("git", "push")
-	if err != nil {
-		return fmt.Errorf("git push: %v", err)
-	}
+		// git push
+		err = run("git", "push")
+		if err != nil {
+			return fmt.Errorf("git push: %v", err)
+		}
 
-	// git push tag
-	err = run("git", "push", "--tags")
-	if err != nil {
-		return fmt.Errorf("pushing tag: %v", err)
+		// git push tag
+		err = run("git", "push", "--tags")
+		if err != nil {
+			return fmt.Errorf("pushing tag: %v", err)
+		}
+
+		// Wait a moment before publishing the release; I've seen the API call
+		// to publish a release on GitHub fail with "Published releases must
+		// have a valid tag" even after pushing the tag. I suspect that their
+		// system must be only "eventually consistent" so perhaps by waiting a
+		// few seconds, we'll alleviate any sort of race condition they have.
+		log.Println("Waiting a few seconds before publishing release...")
+		time.Sleep(5 * time.Second)
 	}
 
 	// create release on GitHub
+	log.Println("Publishing release to GitHub")
 	ghClient, release, err := publishReleaseToGitHub(tag, prerelease)
 	if err != nil {
 		return fmt.Errorf("creating release: %v", err)
 	}
 
 	// set up environment in which to perform builds
+	log.Println("Preparing builds")
 	deployEnv, err := buildworker.Open(tag, nil)
 	if err != nil {
 		return fmt.Errorf("opening build environment: %v", err)
@@ -195,8 +256,43 @@ func deploy(tag string, prerelease bool) error {
 
 	wg.Wait()
 
+	// deploy to Caddy build server if not a pre-release
 	if !prerelease {
-		// TODO: Deploy to Caddy build server
+		log.Println("Deploying to build server")
+
+		// prepare request body
+		type DeployRequest struct {
+			CaddyVersion string `json:"caddy_version"`
+		}
+		bodyInfo := DeployRequest{CaddyVersion: tag}
+		body, err := json.Marshal(bodyInfo)
+		if err != nil {
+			return fmt.Errorf("preparing request body: %v", err)
+		}
+
+		// prepare request
+		req, err := http.NewRequest("POST", websiteURL+"/api/deploy-caddy", bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("preparing request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.SetBasicAuth(devportalAccountID, devportalAPIKey)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("network error deploying to website: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			respBody, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				return fmt.Errorf("reading response body: %v", err)
+			}
+			return fmt.Errorf("deploy to build server failed, HTTP %d: %s", resp.StatusCode, respBody)
+		}
+
+		log.Printf("Deploy request successfully sent to Caddy build server")
 	}
 
 	return nil
@@ -259,11 +355,11 @@ func envVariablesSet() error {
 	if githubAccessToken == "" {
 		return fmt.Errorf("environment variable GITHUB_TOKEN cannot be empty")
 	}
-	if buildServerKey == "" {
-		return fmt.Errorf("environment variable BUILD_SERVER_ID cannot be empty")
+	if devportalAccountID == "" {
+		return fmt.Errorf("environment variable DEVPORTAL_ID cannot be empty")
 	}
-	if buildServerKey == "" {
-		return fmt.Errorf("environment variable BUILD_SERVER_KEY cannot be empty")
+	if devportalAPIKey == "" {
+		return fmt.Errorf("environment variable DEVPORTAL_KEY cannot be empty")
 	}
 	if os.Getenv("GOPATH") == "" {
 		return fmt.Errorf("environment variable GOPATH cannot be empty")
@@ -328,14 +424,15 @@ func confirmReadmeUpdated() error {
 	return nil
 }
 
-// nextTagSuggestions returns a list of suggested
-// tags based on the most recent tag.
-func nextTagSuggestions() ([]string, error) {
+// getCurrentTag returns the current tag of the Caddy repo.
+// If there is no current tag, a "dummy" tag of "v0.0.0" will
+// be returned for consistency with semantic versioning.
+func getCurrentTag() (string, error) {
 	cmd := exec.Command("git", "tag")
 	cmd.Dir = caddyRepo
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
 	allTags := strings.Split(strings.TrimSpace(string(out)), "\n")
@@ -344,10 +441,23 @@ func nextTagSuggestions() ([]string, error) {
 	}
 	sort.Strings(allTags)
 
-	// get the last tag in a nicely-parsed state
-	lastTagRaw := allTags[len(allTags)-1]
-	lastTag := strings.TrimLeft(lastTagRaw, "v")
-	tagParts := strings.Split(lastTag, ".")
+	// return the last tag (which is presumably the most recent)
+	return allTags[len(allTags)-1], nil
+}
+
+// isPrerelease returns true if tag looks like a pre-release version.
+func isPrerelease(tag string) bool {
+	return strings.Contains(tag, "-alpha") ||
+		strings.Contains(tag, "-beta") ||
+		strings.Contains(tag, "-pre") ||
+		strings.Contains(tag, "-rc")
+}
+
+// nextTagSuggestions returns a list of suggested tags based on the
+// most recent tag, which must be passed in as currentTagRaw.
+func nextTagSuggestions(currentTagRaw string) ([]string, error) {
+	currentTag := strings.TrimLeft(currentTagRaw, "v")
+	tagParts := strings.Split(currentTag, ".")
 
 	// viable tags come from incrementing each part
 	// of the semantic version number, and setting
@@ -365,7 +475,7 @@ func nextTagSuggestions() ([]string, error) {
 			nextVer[j] = "0"
 		}
 		next := strings.Join(nextVer, ".")
-		if strings.HasPrefix(lastTagRaw, "v") {
+		if strings.HasPrefix(currentTagRaw, "v") {
 			next = "v" + next
 		}
 		nextVers = append(nextVers, next)
@@ -378,14 +488,19 @@ func nextTagSuggestions() ([]string, error) {
 // this release. It returns the tag name, whether
 // this is a pre-release tag, and/or an error.
 func askNewTagVersion() (string, bool, error) {
-	nextVers, err := nextTagSuggestions()
+	currentTagRaw, err := getCurrentTag()
+	if err != nil {
+		return "", false, err
+	}
+
+	nextVers, err := nextTagSuggestions(currentTagRaw)
 	if err != nil {
 		return "", false, err
 	}
 
 	const other = "Other..."
 	tag, err := survey.AskOneValidate(&survey.Choice{
-		Message: "What should the new tag be?",
+		Message: "Current tag is " + currentTagRaw + ". What should the new tag be?",
 		Choices: append(nextVers, other),
 	}, survey.Required)
 	if err != nil {
@@ -401,12 +516,7 @@ func askNewTagVersion() (string, bool, error) {
 		}
 	}
 
-	prerelease := strings.Contains(tag, "-alpha") ||
-		strings.Contains(tag, "-beta") ||
-		strings.Contains(tag, "-pre") ||
-		strings.Contains(tag, "-rc")
-
-	return tag, prerelease, nil
+	return tag, isPrerelease(tag), nil
 }
 
 // askYesNo asks a No/Yes question and returns true
