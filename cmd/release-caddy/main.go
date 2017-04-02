@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -231,7 +232,8 @@ func deploy(tag string, prerelease bool, resume string) error {
 			file, err := deployEnv.Build(plat, tmpdir)
 			<-buildThrottle
 			if err != nil {
-				log.Printf("building %s: %v", plat, err)
+				log.Printf("building %s: %v\n", plat, err)
+				log.Printf(">>>>>>>>>>>>%s\n<<<<<<<<<<<<\n", deployEnv.Log.String())
 				return
 			}
 			defer func() {
@@ -239,13 +241,15 @@ func deploy(tag string, prerelease bool, resume string) error {
 				os.Remove(file.Name())
 			}()
 
+			// TODO: upload a text file with the SHA-256 of all
+			// release assets uploaded to GitHub.
+
 			// upload
 			uploadThrottle <- struct{}{}
 			defer func() { <-uploadThrottle }()
 			log.Printf("Uploading %s...", plat)
-			_, _, err = ghClient.Repositories.UploadReleaseAsset(githubOwner, githubRepo, *release.ID, &github.UploadOptions{
-				Name: filepath.Base(file.Name()),
-			}, file)
+			_, _, err = ghClient.Repositories.UploadReleaseAsset(context.Background(), githubOwner,
+				githubRepo, release.GetID(), &github.UploadOptions{Name: filepath.Base(file.Name())}, file)
 			if err != nil {
 				log.Printf("!! Error uploading %+v: %v", plat, err)
 				return
@@ -331,7 +335,11 @@ func checkCaddy() error {
 	}
 
 	// run checks and report results
-	return be.RunCaddyChecks()
+	err = be.RunCaddyChecks()
+	if err != nil {
+		log.Printf("error; here's the log:\n>>>>>>>>>>>>%s\n<<<<<<<<<<<<\n", be.Log.String())
+	}
+	return err
 }
 
 // publishReleaseToGitHub makes a new release on GitHub
@@ -341,11 +349,12 @@ func publishReleaseToGitHub(tag string, prerelease bool) (*github.Client, *githu
 		&oauth2.Token{AccessToken: githubAccessToken},
 	))
 	client := github.NewClient(tc)
-	release, _, err := client.Repositories.CreateRelease(githubOwner, githubRepo, &github.RepositoryRelease{
-		TagName:    github.String(tag),
-		Name:       github.String(strings.TrimPrefix(tag, "v")),
-		Prerelease: github.Bool(prerelease),
-	})
+	release, _, err := client.Repositories.CreateRelease(context.Background(), githubOwner, githubRepo,
+		&github.RepositoryRelease{
+			TagName:    github.String(tag),
+			Name:       github.String(strings.TrimPrefix(tag, "v")),
+			Prerelease: github.Bool(prerelease),
+		})
 	return client, release, err
 }
 
@@ -367,7 +376,7 @@ func envVariablesSet() error {
 	return nil
 }
 
-// workingCopyClean asserts that thecaddy repository has
+// workingCopyClean asserts that the caddy repository has
 // no uncommitted changes. If an error is returned, then
 // either an error occurred, or `git status` showed that
 // tracked files have been modified. It is not advisable
