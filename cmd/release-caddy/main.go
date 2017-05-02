@@ -448,10 +448,39 @@ func getCurrentTag() (string, error) {
 	if len(allTags) == 0 || (len(allTags) == 1 && allTags[0] == "") {
 		allTags = []string{"v0.0.0"} // alright--starting from nothing, are we?
 	}
-	sort.Strings(allTags)
 
-	// return the last tag (which is presumably the most recent)
-	return allTags[len(allTags)-1], nil
+	// sort by comparing each version label successively; string
+	// sort won't do the trick because 10 < 9 sorting by strings.
+	sort.Slice(allTags, func(i int, j int) bool {
+		tagI := strings.TrimLeft("v", allTags[i])
+		tagJ := strings.TrimLeft("v", allTags[j])
+		partsI := strings.Split(tagI, ".")
+		partsJ := strings.Split(tagJ, ".")
+		for len(partsI) < 3 {
+			partsI = append(partsI, "0")
+		}
+		for len(partsJ) < 3 {
+			partsJ = append(partsJ, "0")
+		}
+		for k := 0; k < 3; k++ {
+			if partsI[k] == partsJ[k] {
+				continue
+			}
+			numI, err := strconv.Atoi(partsI[k])
+			if err != nil {
+				return false
+			}
+			numJ, err := strconv.Atoi(partsI[j])
+			if err != nil {
+				return false
+			}
+			return numI < numJ
+		}
+		return false
+	})
+
+	// return the first tag, which is the "highest" (most recent) version
+	return allTags[0], nil
 }
 
 // isPrerelease returns true if tag looks like a pre-release version.
@@ -467,6 +496,9 @@ func isPrerelease(tag string) bool {
 func nextTagSuggestions(currentTagRaw string) ([]string, error) {
 	currentTag := strings.TrimLeft(currentTagRaw, "v")
 	tagParts := strings.Split(currentTag, ".")
+	for len(tagParts) < 3 {
+		tagParts = append(tagParts, "0")
+	}
 
 	// viable tags come from incrementing each part
 	// of the semantic version number, and setting
@@ -482,6 +514,9 @@ func nextTagSuggestions(currentTagRaw string) ([]string, error) {
 		nextVer[i] = strconv.Itoa(num + 1)
 		for j := i + 1; j < len(nextVer); j++ {
 			nextVer[j] = "0"
+		}
+		if len(nextVer) == 3 && nextVer[2] == "0" {
+			nextVer = nextVer[:2] // drop trailing ".0" in third part ("v0.10" instead of "v0.10.0")
 		}
 		next := strings.Join(nextVer, ".")
 		if strings.HasPrefix(currentTagRaw, "v") {
