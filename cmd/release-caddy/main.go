@@ -39,9 +39,9 @@ var (
 )
 
 const (
-	githubOwner = "mholt" // the owner of the repository to publish to
-	githubRepo  = "caddy" // the owner's repository to publish to
-	websiteURL  = "http://localhost:2015" // URL to the Caddy website
+	githubOwner = "mholt"                   // the owner of the repository to publish to
+	githubRepo  = "caddy"                   // the owner's repository to publish to
+	websiteURL  = "https://caddyserver.com" // URL to the Caddy website
 )
 
 func main() {
@@ -141,18 +141,21 @@ func deploy(tag string, prerelease bool, resume string) error {
 		}
 
 		// git tag (signed)
+		log.Println("Tagging release")
 		err = run("git", "tag", "-s", tag, "-m", "")
 		if err != nil {
 			return fmt.Errorf("creating signed tag: %v", err)
 		}
 
 		// git push
+		log.Println("Pushing tag")
 		err = run("git", "push")
 		if err != nil {
 			return fmt.Errorf("git push: %v", err)
 		}
 
 		// git push tag
+		log.Println("Pushing any remaining commits")
 		err = run("git", "push", "--tags")
 		if err != nil {
 			return fmt.Errorf("pushing tag: %v", err)
@@ -247,14 +250,24 @@ func deploy(tag string, prerelease bool, resume string) error {
 			// upload
 			uploadThrottle <- struct{}{}
 			defer func() { <-uploadThrottle }()
-			log.Printf("Uploading %s...", plat)
-			_, _, err = ghClient.Repositories.UploadReleaseAsset(context.Background(), githubOwner,
-				githubRepo, release.GetID(), &github.UploadOptions{Name: filepath.Base(file.Name())}, file)
-			if err != nil {
-				log.Printf("!! Error uploading %+v: %v", plat, err)
-				return
+			maxAttempts := 5
+			for i := 0; i < maxAttempts; i++ {
+				log.Printf("Uploading %s... (attempt %d)", plat, i+1)
+				_, _, err = ghClient.Repositories.UploadReleaseAsset(context.Background(), githubOwner,
+					githubRepo, release.GetID(), &github.UploadOptions{Name: filepath.Base(file.Name())}, file)
+				if err != nil {
+					log.Printf("Error uploading %+v: %v", plat, err)
+					if i < maxAttempts-1 {
+						log.Printf("Trying again to upload %s", plat)
+					} else {
+						log.Printf("!! ERROR: COULD NOT UPLOAD %+v", plat, err)
+						return
+					}
+				} else {
+					log.Printf("Uploaded %s successfully", plat)
+					break
+				}
 			}
-			log.Printf("Uploaded %s successfully", plat)
 		}(tag, plat)
 	}
 
@@ -311,8 +324,10 @@ func checkCaddy() error {
 		return err
 	}
 	currentCommit := strings.TrimSpace(string(out))
+	log.Printf("Caddy is currently at commit: %s", currentCommit)
 
 	// create build environment, with no plugins
+	log.Println("Opening build environment")
 	be, err := buildworker.Open(currentCommit, nil)
 	if err != nil {
 		return fmt.Errorf("opening build environment: %v", err)
@@ -329,12 +344,14 @@ func checkCaddy() error {
 	// the update, as that would involve a massive
 	// overwrite of the whole GOPATH on some developer's
 	// machine, which makes me uncomfortable.
+	log.Println("Updating master GOPATH")
 	err = be.UpdateMasterGopath()
 	if err != nil {
 		return fmt.Errorf("updating master GOPATH: %v", err)
 	}
 
 	// run checks and report results
+	log.Println("Running tests and cross-platform build checks on Caddy (this may take a while)")
 	err = be.RunCaddyChecks()
 	if err != nil {
 		log.Printf("error; here's the log:\n>>>>>>>>>>>>%s\n<<<<<<<<<<<<\n", be.Log.String())
