@@ -134,6 +134,8 @@ func main() {
 // resume the deploy at, if at all (otherwise empty string).
 func deploy(tag string, prerelease bool, resume string) error {
 	if resume == "" {
+		log.Printf("Preparing to deploy new tag: %s", tag)
+
 		// run checks to make sure it, you know, works.
 		err := checkCaddy()
 		if err != nil {
@@ -259,8 +261,13 @@ func deploy(tag string, prerelease bool, resume string) error {
 					log.Printf("Error uploading %+v: %v", plat, err)
 					if i < maxAttempts-1 {
 						log.Printf("Trying again to upload %s", plat)
+						_, err = file.Seek(0, 0)
+						if err != nil {
+							log.Printf("!! ERROR: COULD NOT SEEK TO BEGINNING OF FILE FOR %+v: %v", plat, err)
+							return
+						}
 					} else {
-						log.Printf("!! ERROR: COULD NOT UPLOAD %+v", plat, err)
+						log.Printf("!! ERROR: COULD NOT UPLOAD %+v: %v", plat, err)
 						return
 					}
 				} else {
